@@ -4,6 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { HandLandmarker, ImageSegmenter, FilesetResolver } from "@mediapipe/tasks-vision";
 import { GestureDetector, Direction } from "@/lib/gesture-detector";
+import { WandTrailEffect } from "@/lib/wand-trail";
+import { SpellBoltEffect } from "@/lib/spell-bolt-effect";
+import { FeatherEffect } from "@/lib/feather-effect";
 import { playSpellSound, SpellId } from "@/lib/spell-sounds";
 import { applyMaskAlpha } from "@/lib/background-composite";
 import { PatronusEffect } from "@/lib/patronus-effect";
@@ -11,14 +14,19 @@ import { startPatronusListener } from "@/lib/voice-recognition";
 import { askForVocativeName, speak } from "@/lib/voice-greeting";
 import { resolveImageUrl } from "@/lib/resolve-asset";
 
-// down is the guided first spell taught in the intro tutorial (see
-// runIntroTutorial) — kept in sync with the "wave down for Lumos" wording.
-const SPELLS: Record<Direction, { id: SpellId; label: string }> = {
-  down: { id: "lumos", label: "Lumos!" },
-  left: { id: "nox", label: "Nox!" },
+// Lumos and Expelliarmus are deliberately not in this map — each has its own
+// dedicated, stricter GestureDetector instance (see lumosDetectorRef /
+// expelliarmusDetectorRef below): Lumos needs a bigger down-swipe than
+// left/right/up require, Expelliarmus needs a genuinely fast left-swipe, not
+// just any left-swipe. Only right/up dispatch through this generic map.
+type SwipeSpellDirection = Exclude<Direction, "down" | "left">;
+
+const SPELLS: Record<SwipeSpellDirection, { id: SpellId; label: string }> = {
+  right: { id: "nox", label: "Nox!" },
   up: { id: "wingardium", label: "Wingardium Leviosa!" },
-  right: { id: "expelliarmus", label: "Expelliarmus!" },
 };
+
+const EXPELLIARMUS_BOLT_COLOR = "#22ff6a";
 
 const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
 const HAND_MODEL_URL =
@@ -56,10 +64,38 @@ export default function WandGamePage() {
   const personCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const backgroundImgRef = useRef<HTMLImageElement | null>(null);
   const detectorRef = useRef(new GestureDetector());
-  const trailRef = useRef<{ x: number; y: number; t: number }[]>([]);
+  // Separate instance, much larger minDistance: makes Lumos require a
+  // bigger, more deliberate down-swipe than left/right/up need, so an
+  // incidental small downward hand movement (lowering the wand between
+  // casts, adjusting grip, etc.) doesn't cast it as easily by accident.
+  const lumosDetectorRef = useRef(new GestureDetector(900, 0.3));
+  // Separate instance, higher minAverageSpeed: Expelliarmus needs a genuinely
+  // fast left-swipe (it's meant to feel like snapping off a shot), not just
+  // any left-swipe at the normal minDistance/speed. 2.2 turned out way too
+  // strict on the first live test (basically unlandable) — dropped to 1.1,
+  // still above MOVE_SPEED_THRESHOLD (0.9 in gesture-detector.ts) so it's
+  // not just "any swipe at all", but far more forgiving than the first try.
+  const expelliarmusDetectorRef = useRef(new GestureDetector(900, 0.18, 1.1));
+  const trailEffectRef = useRef(new WandTrailEffect(500));
   const patronusRef = useRef(new PatronusEffect());
+  const boltEffectRef = useRef(new SpellBoltEffect());
+  const featherEffectRef = useRef(new FeatherEffect());
+  // Updated every frame the hand is tracked (raw pre-mirror pixel coords,
+  // same space as the trail). teachWingardium() needs "where is the wand tip
+  // right now" to spawn the feather there, but it runs from an async
+  // tutorial-flow function outside loop()'s per-frame closure.
+  const lastHandTipRef = useRef({ x: 0, y: 0 });
   const rafRef = useRef<number | null>(null);
-  const tutorialStepRef = useRef<"pending" | "guide-down" | "done">("pending");
+  const tutorialStepRef = useRef<
+    | "pending"
+    | "guide-lumos"
+    | "learning"
+    | "guide-nox"
+    | "guide-expelliarmus"
+    | "guide-wingardium"
+    | "guide-patronus"
+    | "done"
+  >("pending");
   const lumosGlowStartRef = useRef<number | null>(null);
 
   const [status, setStatus] = useState<Status>("loading");
@@ -144,17 +180,32 @@ export default function WandGamePage() {
       setSpellText("Expecto Patronum!");
       if (spellTimeoutRef.current) clearTimeout(spellTimeoutRef.current);
       spellTimeoutRef.current = setTimeout(() => setSpellText(null), 2500);
+
+      // One shared trigger regardless of which path recognized it (the
+      // phrase or the animal-name fallback — see teachPatronus()), so the
+      // tutorial-advance logic only has to live in one place.
+      if (tutorialStepRef.current === "guide-patronus") {
+        tutorialStepRef.current = "done";
+        celebrateTutorialComplete();
+      }
     }
 
-    const patronusListener = startPatronusListener(triggerPatronus);
+    // "patron" (not the specific animal name — "liška" turned out to be
+    // unreliable for the recognizer to catch) as an easier-to-say fallback
+    // alongside "Expecto Patronum", on the same always-on listener.
+    const patronusListener = startPatronusListener(triggerPatronus, ["patron"]);
 
     let introInProgress = false;
     let praiseTimeout: ReturnType<typeof setTimeout> | null = null;
 
     // The ideal flow: ask the child's name, greet them, then walk them
-    // through their very first spell (wave the wand down for Lumos) with a
-    // spoken instruction and an on-screen arrow — only once that gesture is
-    // actually detected does the guide go away and free play begins.
+    // through their first two spells in sequence — Lumos (trace an "L" with
+    // the wand) then Nox (swipe right) — each with a spoken instruction and
+    // an on-screen guide that only goes away once that gesture actually
+    // lands. The Lumos->Nox handoff (praise, then the next instruction)
+    // happens from inside loop() when the gesture completes (see
+    // castSpell/praiseThen below), not here — this function only gets the
+    // child to the starting line.
     async function runIntroTutorial() {
       if (introInProgress) return;
       introInProgress = true;
@@ -171,15 +222,117 @@ export default function WandGamePage() {
         await speak(greeting);
         if (cancelled) return;
 
-        const instruction = "Teď zkus své první kouzlo! Máchni hůlkou dolů a řekni: Lumos!";
+        const instruction =
+          "Teď zkus své první kouzlo! Zkusíme rozsvítit lampu. Máchni hůlkou dolů a řekni: Lumos!";
         setGreetingText(instruction);
-        tutorialStepRef.current = "guide-down"; // shows the down-arrow guide
         await speak(instruction);
-        // Text + arrow stay on screen until the down gesture actually lands.
+        if (cancelled) return;
+        tutorialStepRef.current = "guide-lumos"; // shows the down-arrow guide, only once the instruction has actually finished
+        // Text + guide stay on screen until the down-swipe actually lands.
       } finally {
         patronusListener.setPaused(false);
         introInProgress = false;
       }
+    }
+
+    // Called once the down-swipe lands during the tutorial — praises, then
+    // teaches Nox. Separate from runIntroTutorial because this fires from
+    // inside loop()'s per-frame gesture handling, not from the initial
+    // name-greeting flow.
+    async function teachNox() {
+      if (cancelled) return;
+      const instruction = "Nyní zkusíme světlo zhasnout. Řekni Nox a máchni hůlkou doprava.";
+      setGreetingText(instruction);
+      await speak(instruction);
+      if (cancelled) return;
+      tutorialStepRef.current = "guide-nox"; // shows the right-arrow guide, only once the instruction has actually finished
+      // Text + guide stay on screen until the right-swipe actually lands.
+    }
+
+    // Called once the right-swipe lands during the tutorial — praises, then
+    // teaches Expelliarmus.
+    async function teachExpelliarmus() {
+      if (cancelled) return;
+      const instruction = "Teď něco pořádného: Expelliarmus! Rychle mávni hůlkou doleva!";
+      setGreetingText(instruction);
+      await speak(instruction);
+      if (cancelled) return;
+      tutorialStepRef.current = "guide-expelliarmus"; // shows the left-arrow guide, only once the instruction has actually finished
+      // Text + guide stay on screen until a fast left-swipe actually lands.
+    }
+
+    // Called once the fast left-swipe lands during the tutorial — praises,
+    // then teaches Wingardium Leviosa. Unlike the others, this one shows a
+    // feather (hovering at the current wand-tip position) instead of a
+    // directional arrow — it's the whole point of this step.
+    async function teachWingardium() {
+      if (cancelled) return;
+      const instruction = "A teď to nejkouzelnější: Wingardium Leviosa! Zvedni pírko mávnutím nahoru.";
+      setGreetingText(instruction);
+      await speak(instruction);
+      if (cancelled) return;
+      tutorialStepRef.current = "guide-wingardium";
+      const tip = lastHandTipRef.current;
+      featherEffectRef.current.show(tip.x, tip.y); // only appears once the instruction has actually finished
+      // Text + feather stay on screen until the up-swipe actually lands.
+    }
+
+    // Called once the up-swipe lands during the tutorial — praises, then
+    // teaches Patronus, the last of the five guided spells. The gesture
+    // "doesn't matter" here (per the owner) — casting is voice-only, same as
+    // free play — so there's no arrow/shape guide for this step, just the
+    // spoken instruction. No fallback timer/second recognition session
+    // needed: `patronusListener` (started below) already matches this
+    // session's animal name on the exact same always-on listener as the
+    // "Expecto Patronum" phrase, so both are live from the first second —
+    // triggerPatronus() (below) handles the tutorial-advance regardless of
+    // which one a kid actually says.
+    async function teachPatronus() {
+      if (cancelled) return;
+      const instruction =
+        "Poslední a nejsilnější kouzlo: vyčaruj svého Patrona! Řekni Expecto Patronum, nebo jen slovo patron, a mávni hůlkou.";
+      setGreetingText(instruction);
+      tutorialStepRef.current = "guide-patronus";
+      await speak(instruction);
+      // Text stays on screen until Patronus actually triggers.
+    }
+
+    // Shared "Skvělé!" praise beat used after tutorial gestures land —
+    // delayed slightly so whatever visual feedback the spell itself causes
+    // (the Lumos glow, the lamp toggling) is already visible before the
+    // praise text/speech lands on top of it.
+    function praiseThen(after?: () => void) {
+      if (praiseTimeout) clearTimeout(praiseTimeout);
+      praiseTimeout = setTimeout(() => {
+        praiseTimeout = null;
+        setSpellText("Skvělé!");
+        if (spellTimeoutRef.current) clearTimeout(spellTimeoutRef.current);
+        spellTimeoutRef.current = setTimeout(() => setSpellText(null), 1500);
+        speak("Skvělé!")
+          .then(() => {
+            if (!cancelled) after?.();
+          })
+          .catch(() => {});
+      }, 600);
+    }
+
+    // The tutorial's closing beat, after Patronus — a longer congratulation
+    // instead of another "Skvělé!", delayed a bit more than praiseThen's
+    // 600ms so the Patronus effect's own fade-in (600ms) has room to land
+    // first. Shown via greetingText (the instruction banner) rather than
+    // spellText, since it's a full sentence, not a short exclamation.
+    function celebrateTutorialComplete() {
+      if (praiseTimeout) clearTimeout(praiseTimeout);
+      praiseTimeout = setTimeout(() => {
+        praiseTimeout = null;
+        const message = "Skvěle! Zvládl jsi svá první kouzla — jsi opravdový kouzelník!";
+        setGreetingText(message);
+        speak(message)
+          .then(() => {
+            if (!cancelled) setGreetingText(null);
+          })
+          .catch(() => {});
+      }, 1200);
     }
 
     // Manual triggers: P = patronus, N = name-greeting + first-spell
@@ -298,12 +451,28 @@ export default function WandGamePage() {
       }
     }
 
-    function triggerSpell(direction: Direction) {
-      const spell = SPELLS[direction];
-      playSpellSound(spell.id);
-      setSpellText(spell.label);
+    function castSpell(id: SpellId, label: string) {
+      playSpellSound(id);
+      setSpellText(label);
       if (spellTimeoutRef.current) clearTimeout(spellTimeoutRef.current);
       spellTimeoutRef.current = setTimeout(() => setSpellText(null), 1200);
+
+      // Best-effort: toggles a real lamp plugged into a HomeKit smart plug via
+      // a local macOS Shortcut (see src/app/api/lamp/route.ts). Fire-and-forget
+      // — a missing/unpaired plug or a Shortcut that hasn't been set up yet
+      // must never break the game.
+      if (id === "lumos" || id === "nox") {
+        fetch("/api/lamp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ state: id === "lumos" ? "on" : "off" }),
+        }).catch((err) => console.warn("[wand] lamp toggle failed:", err));
+      }
+    }
+
+    function triggerSpell(direction: SwipeSpellDirection) {
+      const spell = SPELLS[direction];
+      castSpell(spell.id, spell.label);
     }
 
     function loop() {
@@ -361,46 +530,93 @@ export default function WandGamePage() {
           const px = tip.x * canvas.width;
           const py = tip.y * canvas.height;
 
-          trailRef.current.push({ x: px, y: py, t: now });
-          trailRef.current = trailRef.current.filter((p) => now - p.t < 500);
+          trailEffectRef.current.addPoint(px, py, now);
+          trailEffectRef.current.render(ctx, now);
+          lastHandTipRef.current = { x: px, y: py };
+          featherEffectRef.current.updateIdlePosition(px, py);
 
-          ctx.strokeStyle = "#facc15";
-          ctx.lineWidth = 4;
-          ctx.beginPath();
-          trailRef.current.forEach((p, i) => {
-            if (i === 0) ctx.moveTo(p.x, p.y);
-            else ctx.lineTo(p.x, p.y);
-          });
-          ctx.stroke();
+          // Gesture detection needs the *mirrored* x, not the raw one: `tip`
+          // comes straight from HandLandmarker on the unmirrored `video`
+          // element, but everything the player actually sees (the person
+          // layer, the trail dot above) is drawn through the mirror
+          // transform. Left/right swipe classification has to match what's
+          // on screen (and the player's own physical left/right in this
+          // self-view mirror), or "swipe right" ends up classified as
+          // "left" and vice versa — exactly what made Nox fire on the wrong
+          // side of a fresh live test once the tutorial started calling out
+          // an explicit on-screen direction for it. Up/down aren't affected
+          // (mirroring is horizontal only), so `tip.y` is used as-is.
+          const mirroredX = 1 - tip.x;
 
-          ctx.fillStyle = "#facc15";
-          ctx.beginPath();
-          ctx.arc(px, py, 8, 0, Math.PI * 2);
-          ctx.fill();
-
-          const direction = detectorRef.current.addSample(tip.x, tip.y, now);
-          if (direction) {
+          const direction = detectorRef.current.addSample(mirroredX, tip.y, now);
+          if (direction && direction !== "down" && direction !== "left") {
             triggerSpell(direction);
+            if (direction === "right" && tutorialStepRef.current === "guide-nox") {
+              tutorialStepRef.current = "learning";
+              setGreetingText(null);
+              praiseThen(teachExpelliarmus);
+            }
+            if (direction === "up") {
+              // No-ops unless the feather is currently idle (i.e. the
+              // Wingardium tutorial step actually showed it) — safe to call
+              // on every free-play up-swipe too.
+              featherEffectRef.current.liftoff(now);
+              if (tutorialStepRef.current === "guide-wingardium") {
+                tutorialStepRef.current = "learning";
+                setGreetingText(null);
+                praiseThen(teachPatronus);
+              }
+            }
+          }
+
+          // Lumos: a separate, stricter-threshold detector (see
+          // lumosDetectorRef above) — only its "down" result matters here.
+          const lumosDirection = lumosDetectorRef.current.addSample(mirroredX, tip.y, now);
+          if (lumosDirection === "down") {
+            castSpell("lumos", "Lumos!");
             // Lumos always flashes the scene brighter, tutorial or not —
             // it's the light spell, so every cast should light things up.
-            if (direction === "down") {
-              lumosGlowStartRef.current = now;
-            }
-            if (direction === "down" && tutorialStepRef.current === "guide-down") {
-              tutorialStepRef.current = "done";
+            lumosGlowStartRef.current = now;
+            if (tutorialStepRef.current === "guide-lumos") {
+              tutorialStepRef.current = "learning";
               setGreetingText(null);
               // Let the glow actually flash on screen for a moment before
-              // the praise lands, so they don't overlap.
-              praiseTimeout = setTimeout(() => {
-                praiseTimeout = null;
-                setSpellText("Skvělé!");
-                if (spellTimeoutRef.current) clearTimeout(spellTimeoutRef.current);
-                spellTimeoutRef.current = setTimeout(() => setSpellText(null), 1500);
-                speak("Skvělé!").catch(() => {});
-              }, 600);
+              // the praise (and then the Nox instruction) land, so they
+              // don't overlap.
+              praiseThen(teachNox);
+            }
+          }
+
+          // Expelliarmus: a separate detector requiring a genuinely fast
+          // swipe (see expelliarmusDetectorRef above) — only its "left"
+          // result matters here.
+          const expelliarmusDirection = expelliarmusDetectorRef.current.addSample(mirroredX, tip.y, now);
+          if (expelliarmusDirection === "left") {
+            castSpell("expelliarmus", "Expelliarmus!");
+            // Fired from wherever the wand tip currently is, mirrored to
+            // match the displayed (mirrored) position — the trail dot and
+            // the person layer both live in that same mirrored space.
+            const displayX = canvas.width - px;
+            boltEffectRef.current.trigger(
+              { x: displayX, y: py },
+              { x: -1, y: 0 },
+              canvas.width * 1.05,
+              EXPELLIARMUS_BOLT_COLOR
+            );
+            if (tutorialStepRef.current === "guide-expelliarmus") {
+              tutorialStepRef.current = "learning";
+              setGreetingText(null);
+              praiseThen(teachWingardium);
             }
           }
         }
+
+        // Drawn inside the mirror transform (unlike the bolt) since it
+        // hovers relative to the wand tip's on-screen position while idle —
+        // same space as the trail dot. Runs unconditionally (not gated on
+        // `hand`) so the rise/fall animation keeps playing even on a frame
+        // where hand tracking briefly drops.
+        featherEffectRef.current.render(ctx, now);
 
         ctx.restore();
 
@@ -408,12 +624,14 @@ export default function WandGamePage() {
         // the person, so it's drawn after restoring the mirror transform.
         patronusRef.current.update(now);
         patronusRef.current.render(ctx, now);
+        boltEffectRef.current.render(ctx, now);
 
-        // 5) First-spell guide arrow (screen-space, not mirrored) — a long,
-        // thin directional arrow (shaft + arrowhead), not an emoji icon, so
-        // it reads as a "swing this way" line rather than a static symbol.
-        // Only shown while waiting for the tutorial's down-swipe.
-        if (tutorialStepRef.current === "guide-down") {
+        // 5) Tutorial guides (screen-space, not mirrored) — hand-drawn glowing
+        // shapes, not emoji icons, so they read as "trace this path" rather
+        // than a static symbol. Only one is ever shown, gated by the current
+        // tutorial step.
+        if (tutorialStepRef.current === "guide-lumos") {
+          // A plain downward arrow — thin shaft + triangular arrowhead.
           const bounce = Math.sin(now / 500) * 16;
           const glowPulse = 0.7 + Math.sin(now / 350) * 0.3;
           const cx = canvas.width / 2;
@@ -440,6 +658,72 @@ export default function WandGamePage() {
           ctx.moveTo(cx - headWidth / 2, tipY - headHeight);
           ctx.lineTo(cx + headWidth / 2, tipY - headHeight);
           ctx.lineTo(cx, tipY);
+          ctx.closePath();
+          ctx.fill();
+
+          ctx.restore();
+        } else if (tutorialStepRef.current === "guide-nox") {
+          // A plain rightward arrow — same shape as the old down-arrow,
+          // rotated: shaft + arrowhead.
+          const bounce = Math.sin(now / 500) * 16;
+          const glowPulse = 0.7 + Math.sin(now / 350) * 0.3;
+          const cy = canvas.height * 0.3 + bounce;
+          const startX = canvas.width * 0.36;
+          const shaftLength = canvas.width * 0.16;
+          const headWidth = 34;
+          const headHeight = 40;
+          const tipX = startX + shaftLength;
+
+          ctx.save();
+          ctx.strokeStyle = `rgba(250, 204, 21, ${glowPulse})`;
+          ctx.fillStyle = `rgba(250, 204, 21, ${glowPulse})`;
+          ctx.shadowColor = "#facc15";
+          ctx.shadowBlur = 24;
+          ctx.lineWidth = 5;
+          ctx.lineCap = "round";
+
+          ctx.beginPath();
+          ctx.moveTo(startX, cy);
+          ctx.lineTo(tipX - headHeight, cy);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(tipX - headHeight, cy - headWidth / 2);
+          ctx.lineTo(tipX - headHeight, cy + headWidth / 2);
+          ctx.lineTo(tipX, cy);
+          ctx.closePath();
+          ctx.fill();
+
+          ctx.restore();
+        } else if (tutorialStepRef.current === "guide-expelliarmus") {
+          // A plain leftward arrow, colored to match the spell's green bolt,
+          // with a faster pulse than the others to hint "do this quickly".
+          const bounce = Math.sin(now / 350) * 16;
+          const glowPulse = 0.7 + Math.sin(now / 220) * 0.3;
+          const cy = canvas.height * 0.3 + bounce;
+          const rightX = canvas.width * 0.64;
+          const shaftLength = canvas.width * 0.16;
+          const headWidth = 34;
+          const headHeight = 40;
+          const tipX = rightX - shaftLength;
+
+          ctx.save();
+          ctx.strokeStyle = `rgba(34, 255, 106, ${glowPulse})`;
+          ctx.fillStyle = `rgba(34, 255, 106, ${glowPulse})`;
+          ctx.shadowColor = EXPELLIARMUS_BOLT_COLOR;
+          ctx.shadowBlur = 24;
+          ctx.lineWidth = 5;
+          ctx.lineCap = "round";
+
+          ctx.beginPath();
+          ctx.moveTo(rightX, cy);
+          ctx.lineTo(tipX + headHeight, cy);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(tipX + headHeight, cy - headWidth / 2);
+          ctx.lineTo(tipX + headHeight, cy + headWidth / 2);
+          ctx.lineTo(tipX, cy);
           ctx.closePath();
           ctx.fill();
 

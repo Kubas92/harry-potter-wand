@@ -5,15 +5,25 @@ type Point = { x: number; y: number; t: number };
 // Tuned for a fingertip tracked in normalized (0..1) video coordinates.
 const MOVE_SPEED_THRESHOLD = 0.9; // normalized units/sec to count as "moving"
 const STILL_SPEED_THRESHOLD = 0.35;
-const MIN_GESTURE_DISTANCE = 0.18; // normalized units — filters out small jitter
+const DEFAULT_MIN_GESTURE_DISTANCE = 0.18; // normalized units — filters out small jitter
 const HISTORY_WINDOW_MS = 1000;
-const COOLDOWN_MS = 900;
+const DEFAULT_COOLDOWN_MS = 900; // spacing between any two classified swipes
 
 export class GestureDetector {
   private history: Point[] = [];
   private moving = false;
   private gestureStart: Point | null = null;
   private lastTriggerAt = 0;
+
+  // `minDistance`/`minAverageSpeed` configurable so a second instance can
+  // require a bigger/more deliberate or a genuinely fast swipe for a
+  // specific direction (see kouzla/hra's Lumos- and Expelliarmus-specific
+  // detectors) without changing the feel of the others.
+  constructor(
+    private cooldownMs: number = DEFAULT_COOLDOWN_MS,
+    private minDistance: number = DEFAULT_MIN_GESTURE_DISTANCE,
+    private minAverageSpeed: number = 0
+  ) {}
 
   addSample(x: number, y: number, t: number): Direction | null {
     this.history.push({ x, y, t });
@@ -38,8 +48,11 @@ export class GestureDetector {
       const dx = x - start.x;
       const dy = y - start.y;
       const distance = Math.hypot(dx, dy);
-      if (distance < MIN_GESTURE_DISTANCE) return null;
-      if (t - this.lastTriggerAt < COOLDOWN_MS) return null;
+      if (distance < this.minDistance) return null;
+
+      const durationSec = (t - start.t) / 1000;
+      if (durationSec > 0 && distance / durationSec < this.minAverageSpeed) return null;
+      if (t - this.lastTriggerAt < this.cooldownMs) return null;
 
       this.lastTriggerAt = t;
       return Math.abs(dx) > Math.abs(dy)

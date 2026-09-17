@@ -23,7 +23,13 @@ export type PatronusListener = {
 // Web Speech API has no official TS lib types (it's non-standard/vendor
 // prefixed), so this stays loosely typed rather than fighting for exact
 // browser-vendor typings.
-export function startPatronusListener(onDetected: () => void): PatronusListener {
+//
+// `extraWords` (optional) also triggers `onDetected()` — used by kouzla/hra
+// so a kid can just say their patron's animal name ("liška") instead of
+// wrestling with "Expecto Patronum", checked on the exact same always-on
+// listener rather than needing a separate recognition session (only one
+// SpeechRecognition can be active at a time — see setPaused below).
+export function startPatronusListener(onDetected: () => void, extraWords: string[] = []): PatronusListener {
   const w = window as unknown as Record<string, unknown>;
   const Ctor = (w.SpeechRecognition || w.webkitSpeechRecognition) as
     | (new () => any) // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -50,7 +56,9 @@ export function startPatronusListener(onDetected: () => void): PatronusListener 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const transcript = event.results[i][0].transcript as string;
         console.log("[wand] heard:", transcript);
-        if (matchesPatronusPhrase(transcript)) {
+        const normalized = normalize(transcript);
+        const matchesExtra = extraWords.some((word) => word && normalized.includes(normalize(word)));
+        if (matchesPatronusPhrase(transcript) || matchesExtra) {
           const now = Date.now();
           if (now - lastTrigger > 4000) {
             lastTrigger = now;

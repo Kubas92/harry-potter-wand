@@ -1,49 +1,10 @@
+import { cutoutImageByLuminance, loadImage } from "./image-cutout";
+
 const FADE_IN_MS = 600;
 const HOLD_MS = 2200;
 const FADE_OUT_MS = 1400;
 const TOTAL_MS = FADE_IN_MS + HOLD_MS + FADE_OUT_MS;
 const CUTOUT_SIZE = 700; // offscreen processing resolution (long edge, px)
-
-// Cuts the dark/light background out of the source image using luminance as
-// alpha (the source is a soft painted glow, so this naturally gives a soft
-// edge without any extra feathering step), producing a canvas with a
-// transparent background that can be drawn directly.
-function buildCutout(img: HTMLImageElement): { canvas: HTMLCanvasElement; aspect: number } {
-  const aspect = img.naturalWidth / img.naturalHeight;
-  const width = aspect >= 1 ? CUTOUT_SIZE : Math.round(CUTOUT_SIZE * aspect);
-  const height = aspect >= 1 ? Math.round(CUTOUT_SIZE / aspect) : CUTOUT_SIZE;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(img, 0, 0, width, height);
-
-  const imageData = ctx.getImageData(0, 0, width, height);
-  const data = imageData.data;
-
-  // Figure out whether the subject is the light pixels (a glow on a dark
-  // background) or the dark pixels (silhouette on a light background) by
-  // checking which is the minority — the subject usually covers less area.
-  let lightCount = 0;
-  let sampleCount = 0;
-  for (let i = 0; i < data.length; i += 4 * 13) {
-    const luminance = (data[i] + data[i + 1] + data[i + 2]) / 3;
-    if (luminance > 128) lightCount++;
-    sampleCount++;
-  }
-  const subjectIsDark = lightCount > sampleCount / 2;
-
-  for (let i = 0; i < data.length; i += 4) {
-    const luminance = (data[i] + data[i + 1] + data[i + 2]) / 3;
-    const brightness = subjectIsDark ? 255 - luminance : luminance;
-    // Push background toward true-0 alpha while keeping the glow's falloff.
-    data[i + 3] = Math.max(0, Math.min(255, (brightness - 35) * 1.6));
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return { canvas, aspect };
-}
 
 export class PatronusEffect {
   private startTime = 0;
@@ -53,13 +14,8 @@ export class PatronusEffect {
   private drawBox = { x: 0, y: 0, w: 0, h: 0 };
 
   async loadShape(imageUrl: string): Promise<void> {
-    const img = new Image();
-    img.src = imageUrl;
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve();
-      img.onerror = () => reject(new Error(`failed to load ${imageUrl}`));
-    });
-    const { canvas, aspect } = buildCutout(img);
+    const img = await loadImage(imageUrl);
+    const { canvas, aspect } = cutoutImageByLuminance(img, CUTOUT_SIZE);
     this.cutout = canvas;
     this.aspect = aspect;
     console.log("[wand] patronus shape ready");

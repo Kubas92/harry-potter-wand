@@ -3,16 +3,15 @@
 import { useState } from "react";
 import Link from "next/link";
 import ResolvedImage from "./resolved-image";
+import { PATRONUS_CATALOG } from "@/lib/patronus-catalog";
 
 const BACKGROUNDS = [
   { id: "1", label: "Bradavice" },
-  { id: "2", label: "Bradavice 2" },
+  { id: "2", label: "Bradavický expres" },
+  { id: "3", label: "Bradavice - hala" },
 ];
 
-const PATRONUSES = [
-  { id: "1", label: "Jelen" },
-  { id: "2", label: "Jelen 2" },
-];
+const PATRONUSES = PATRONUS_CATALOG;
 
 export default function KouzlaSetupPage() {
   const [background, setBackground] = useState("1");
@@ -27,9 +26,9 @@ export default function KouzlaSetupPage() {
         <h1 className="text-3xl font-semibold mt-2">Základy kouzel</h1>
       </div>
 
-      <section className="w-full max-w-2xl">
+      <section className="w-full max-w-3xl">
         <h2 className="text-xl mb-3">Vyber pozadí</h2>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-3 gap-4">
           {BACKGROUNDS.map((bg) => (
             <button
               key={bg.id}
@@ -45,9 +44,9 @@ export default function KouzlaSetupPage() {
         </div>
       </section>
 
-      <section className="w-full max-w-2xl">
+      <section className="w-full max-w-3xl">
         <h2 className="text-xl mb-3">Vyber patrona</h2>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-4 gap-4">
           {PATRONUSES.map((p) => (
             <button
               key={p.id}

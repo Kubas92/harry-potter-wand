@@ -3,7 +3,11 @@
 import { useState } from "react";
 import Link from "next/link";
 
-const BUBAK_TYPES = [{ id: "spiders", label: "Pavouci", emoji: "🕷️" }];
+const BUBAK_TYPES = [
+  { id: "spiders", label: "Pavouci", emoji: "🕷️" },
+  { id: "dementor", label: "Mozkomor", emoji: "💀" },
+  { id: "snake", label: "Had", emoji: "🐍" },
+];
 
 export default function BubaciSetupPage() {
   const [bubak, setBubak] = useState(BUBAK_TYPES[0].id);
@@ -17,9 +21,9 @@ export default function BubaciSetupPage() {
         <h1 className="text-3xl font-semibold mt-2">Zažeň bubáka</h1>
       </div>
 
-      <section className="w-full max-w-2xl">
+      <section className="w-full max-w-3xl">
         <h2 className="text-xl mb-3">Vyber bubáka</h2>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-3 gap-4">
           {BUBAK_TYPES.map((b) => (
             <button
               key={b.id}
