@@ -1,9 +1,20 @@
 import Link from "next/link";
 import { MenuBackground } from "./menu-background";
+import { WEB_BUILD } from "@/lib/web-build";
 
 const ACTIVITIES = [
   { href: "/kouzla", label: "Základy kouzel", emoji: "🪄" },
   { href: "/bubaci", label: "Zažeň bubáka", emoji: "👻" },
+  { href: "/famfrpal", label: "Trénink famfrpálu", emoji: "🏆" },
+];
+
+// Operator tools (not activities for the kids) — kept small and out of the
+// way at the bottom of the hub. They all need the local photo/lamp API, so
+// the public web build hides them.
+const TOOLS = [
+  { href: "/kontrola", label: "🔧 Kontrola" },
+  { href: "/fotky", label: "🖼 Fotky" },
+  { href: "/diplomy", label: "📜 Diplomy" },
 ];
 
 export default function HomePage() {
@@ -24,6 +35,16 @@ export default function HomePage() {
           </Link>
         ))}
       </div>
+
+      {!WEB_BUILD && (
+        <nav className="absolute bottom-6 z-10 flex gap-6 text-sm text-white/40">
+          {TOOLS.map((tool) => (
+            <Link key={tool.href} href={tool.href} className="hover:text-white">
+              {tool.label}
+            </Link>
+          ))}
+        </nav>
+      )}
     </main>
   );
 }

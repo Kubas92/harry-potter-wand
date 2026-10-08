@@ -1,3 +1,5 @@
+import { asset } from "./web-build";
+
 const IMAGE_EXTENSIONS = ["webp", "jpg", "jpeg", "png"];
 
 // Given a path without extension (e.g. "/patronus/2"), finds whichever
@@ -12,7 +14,7 @@ export function resolveImageUrl(basePath: string): Promise<string> {
         reject(new Error(`no image found for ${basePath} (tried: ${tried})`));
         return;
       }
-      const url = `${basePath}.${IMAGE_EXTENSIONS[i]}`;
+      const url = asset(`${basePath}.${IMAGE_EXTENSIONS[i]}`);
       const probe = new Image();
       probe.onload = () => resolve(url);
       probe.onerror = () => {

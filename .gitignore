@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# boggart-reaction snapshots from /api/photos — photos of kids, never commit
+/photos/
+
+# MediaPipe wasm + models, fetched by scripts/fetch-mediapipe-assets.mjs
+/public/mediapipe/

@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { HandLandmarker, FaceLandmarker, ImageSegmenter, FilesetResolver } from "@mediapipe/tasks-vision";
 import { CircleGestureDetector } from "@/lib/circle-gesture-detector";
 import { WandTrailEffect } from "@/lib/wand-trail";
@@ -10,16 +10,13 @@ import { DementorEffect } from "@/lib/dementor-effect";
 import { SnakeEffect } from "@/lib/snake-effect";
 import { applyMaskAlpha, computeMaskBounds, NormalizedBounds } from "@/lib/background-composite";
 import { playSpellSound } from "@/lib/spell-sounds";
+import { silenceMediapipeInfoLogs } from "@/lib/silence-mediapipe-logs";
+import { WASM_BASE, HAND_MODEL_URL, FACE_MODEL_URL, SEGMENTER_MODEL_URL } from "@/lib/mediapipe-assets";
 import { askForVocativeName, speak } from "@/lib/voice-greeting";
 import { resolveImageUrl } from "@/lib/resolve-asset";
+import { asset } from "@/lib/web-build";
+import { newPhotoSession, uploadCanvasPhoto } from "@/lib/photo-upload";
 
-const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
-const HAND_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
-const FACE_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
-const SEGMENTER_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 
 // Same convention as kouzla/hra: flip if the mask ever comes back inverted.
 const INVERT_SEGMENTATION_MASK = false;
@@ -31,13 +28,38 @@ const SNAKE_IMAGE_BASE_PATH = "/bubaci/had";
 
 const RESPAWN_DELAY_MS = 700;
 
+// A round ends after this many successful banishes — otherwise a single kid
+// could keep going indefinitely, and the owner wants the game to cycle back
+// to the menu on its own so the next kid can start fresh.
+const BANISH_LIMIT = 5;
+// How long the "Výborně!" completion message stays on screen (and is spoken)
+// before auto-navigating back to the menu.
+const ROUND_COMPLETE_REDIRECT_MS = 2000;
+
+// Reaction photos: every time a boggart appears, save a short burst of
+// canvas snapshots (camera + boggart, as seen on the TV) via /api/photos
+// into photos/bubaci/<session>/ — one session folder per page load, i.e.
+// per kid. Delays are ms after the appearance; spiders/dementors fade/crawl
+// in, so their burst starts a bit later than the snake's (which is already
+// at full size when "holding" begins).
+const PHOTO_DELAYS_MS = [300, 900, 1500] as const;
+const SNAKE_PHOTO_DELAYS_MS = [0, 300, 600] as const;
+// On screen the striking snake covers the kid's face, so snake strikes also
+// save a "portrait" composite: camera → smaller snake peeking over the
+// kid's shoulder → segmented kid cut out on top, so the snake is *behind*
+// them. Offset/size are fractions of canvas width, relative to the face
+// (nose tip); the snake goes to whichever side has more room.
+const SNAKE_PORTRAIT_OFFSET_X = 0.2;
+const SNAKE_PORTRAIT_OFFSET_Y = -0.08;
+const SNAKE_PORTRAIT_WIDTH_FRACTION = 0.5;
+
 // Background music — same track as kouzla/hra (public/music/background.mp3),
 // but a different, louder, more tense segment (2:30-3:40) looped instead of
 // the calmer opening used there, and at a higher volume ("ať je to
 // dramatické" — this is the scary-boggart game, not the gentle spell one).
 const BUBACI_MUSIC_START_SECONDS = 2 * 60 + 30; // 2:30
 const BUBACI_MUSIC_END_SECONDS = 3 * 60 + 40; // 3:40
-const BUBACI_MUSIC_VOLUME = 0.5;
+const BUBACI_MUSIC_VOLUME = 0.4;
 
 // Kids hold a real wand that extends past their index fingertip, so anchoring
 // the dot/trail directly to the hand[8] landmark makes it visibly lag behind
@@ -71,7 +93,8 @@ const LOADING_MESSAGES: Record<string, string> = {
   segmenter: "Připravuji mozkomora...",
 };
 
-export default function BubaciGamePage() {
+function BubaciGamePageInner() {
+  const router = useRouter();
   const searchParams = useSearchParams();
   const bubakType = searchParams.get("bubak") ?? "spiders";
   const isDementor = bubakType === "dementor";
@@ -91,6 +114,10 @@ export default function BubaciGamePage() {
   const nextSpawnAtRef = useRef<number | null>(null);
   const introDoneRef = useRef(false);
   const rafRef = useRef<number | null>(null);
+  const banishCountRef = useRef(0);
+  const lastSnakeStrikeCountRef = useRef(0);
+  const lastFaceRef = useRef<{ x: number; y: number } | null>(null);
+  const roundCompleteRef = useRef(false);
 
   const [status, setStatus] = useState<Status>("loading");
   const [loadingStep, setLoadingStep] = useState<keyof typeof LOADING_MESSAGES>("camera");
@@ -98,6 +125,7 @@ export default function BubaciGamePage() {
   const [introText, setIntroText] = useState<string | null>(null);
   const [banishText, setBanishText] = useState<string | null>(null);
   const banishTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const redirectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (musicRef.current) musicRef.current.volume = BUBACI_MUSIC_VOLUME;
@@ -111,7 +139,68 @@ export default function BubaciGamePage() {
   }, [status]);
 
   useEffect(() => {
+    silenceMediapipeInfoLogs();
     let cancelled = false;
+    const photoTimeouts = new Set<ReturnType<typeof setTimeout>>();
+    const photoSession = newPhotoSession(bubakType);
+
+    // Builds the snake "portrait" off-screen (never shown on the TV) — see
+    // SNAKE_PORTRAIT_* above. The segmenter only runs here, a few times per
+    // strike, not every frame, so the snake game's per-frame cost is
+    // unchanged.
+    function captureSnakePortrait(label: string) {
+      const video = videoRef.current;
+      if (!video || !imageSegmenter || cancelled || video.readyState < 2) return;
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+
+      const person = document.createElement("canvas");
+      person.width = w;
+      person.height = h;
+      const personCtx = person.getContext("2d", { willReadFrequently: true })!;
+      personCtx.drawImage(video, 0, 0, w, h);
+      const mask = imageSegmenter.segmentForVideo(video, performance.now()).confidenceMasks?.[0];
+      if (!mask) return;
+      applyMaskAlpha(personCtx, w, h, mask.getAsFloat32Array(), mask.width, mask.height, INVERT_SEGMENTATION_MASK);
+      mask.close();
+
+      const photo = document.createElement("canvas");
+      photo.width = w;
+      photo.height = h;
+      const ctx = photo.getContext("2d")!;
+      // Same mirrored space as the game view, so the photo matches the TV.
+      ctx.scale(-1, 1);
+      ctx.translate(-w, 0);
+      ctx.drawImage(video, 0, 0, w, h);
+      const face = lastFaceRef.current ?? { x: 0.5, y: 0.4 };
+      const side = face.x < 0.5 ? 1 : -1;
+      const drawn = snakeRef.current.drawPortrait(
+        ctx,
+        (face.x + side * SNAKE_PORTRAIT_OFFSET_X) * w,
+        face.y * h + SNAKE_PORTRAIT_OFFSET_Y * w,
+        w * SNAKE_PORTRAIT_WIDTH_FRACTION
+      );
+      if (!drawn) return;
+      ctx.drawImage(person, 0, 0);
+      uploadCanvasPhoto("bubaci", photoSession, label, photo);
+    }
+
+    function capturePhoto(label: string) {
+      const canvas = canvasRef.current;
+      if (!canvas || cancelled) return;
+      uploadCanvasPhoto("bubaci", photoSession, label, canvas);
+    }
+
+    function capturePhotoBurst(delays: readonly number[]) {
+      delays.forEach((delay, i) => {
+        const t = setTimeout(() => {
+          photoTimeouts.delete(t);
+          capturePhoto(`${bubakType}-${i + 1}`);
+          if (isSnake) captureSnakePortrait(`${bubakType}-portrait-${i + 1}`);
+        }, delay);
+        photoTimeouts.add(t);
+      });
+    }
     let stream: MediaStream | null = null;
     let handLandmarker: HandLandmarker | null = null;
     let faceLandmarker: FaceLandmarker | null = null;
@@ -187,6 +276,21 @@ export default function BubaciGamePage() {
         spiderRef.current = new SpiderEffect();
       }
       introDoneRef.current = true;
+    }
+
+    async function completeRound() {
+      playSpellSound("fanfare");
+      const congrats = isDementor
+        ? "Výborně, zahnal jsi bubáky!"
+        : isSnake
+          ? "Výborně, zahnal jsi hady!"
+          : "Výborně, zahnal jsi pavouky!";
+      setIntroText(congrats);
+      await speak(congrats);
+      if (cancelled) return;
+      redirectTimeoutRef.current = setTimeout(() => {
+        if (!cancelled) router.push("/");
+      }, ROUND_COMPLETE_REDIRECT_MS);
     }
 
     async function init() {
@@ -281,6 +385,29 @@ export default function BubaciGamePage() {
               numFaces: 1,
             });
           }
+          if (isSnake) {
+            // Photo-only (see captureSnakePortrait) — not run per frame.
+            if (cancelled) {
+              releaseAll();
+              return;
+            }
+            setLoadingStep("segmenter");
+            try {
+              imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: SEGMENTER_MODEL_URL, delegate: "GPU" },
+                runningMode: "VIDEO",
+                outputCategoryMask: false,
+                outputConfidenceMasks: true,
+              });
+            } catch {
+              imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: SEGMENTER_MODEL_URL, delegate: "CPU" },
+                runningMode: "VIDEO",
+                outputCategoryMask: false,
+                outputConfidenceMasks: true,
+              });
+            }
+          }
         }
 
         if (cancelled) {
@@ -363,12 +490,18 @@ export default function BubaciGamePage() {
               dementorRef.current.render(ctx, canvas.width, canvas.height, now, personBounds);
               if (dementorRef.current.isDone()) {
                 dementorActiveRef.current = false;
-                nextSpawnAtRef.current = now + RESPAWN_DELAY_MS;
+                if (banishCountRef.current >= BANISH_LIMIT) {
+                  roundCompleteRef.current = true;
+                  completeRound();
+                } else {
+                  nextSpawnAtRef.current = now + RESPAWN_DELAY_MS;
+                }
               }
-            } else if (nextSpawnAtRef.current !== null && now >= nextSpawnAtRef.current) {
+            } else if (!roundCompleteRef.current && nextSpawnAtRef.current !== null && now >= nextSpawnAtRef.current) {
               dementorRef.current.spawn();
               dementorActiveRef.current = true;
               nextSpawnAtRef.current = null;
+              capturePhotoBurst(PHOTO_DELAYS_MS);
             }
           }
 
@@ -380,15 +513,28 @@ export default function BubaciGamePage() {
           // uses) — aim the strike at the child's actual face, not a fixed
           // screen point.
           const faceTarget = face ? { x: face[1].x, y: face[1].y } : null;
+          if (faceTarget) lastFaceRef.current = faceTarget;
 
           if (introDoneRef.current) {
             if (snakeActiveRef.current) {
               snakeRef.current.render(ctx, canvas.width, canvas.height, now, faceTarget);
+              // The snake is invisible until it strikes (possibly several
+              // times per spawn) — photograph each strike, not the spawn.
+              const strikes = snakeRef.current.getStrikeCount();
+              if (strikes > lastSnakeStrikeCountRef.current) {
+                lastSnakeStrikeCountRef.current = strikes;
+                capturePhotoBurst(SNAKE_PHOTO_DELAYS_MS);
+              }
               if (snakeRef.current.isDone()) {
                 snakeActiveRef.current = false;
-                nextSpawnAtRef.current = now + RESPAWN_DELAY_MS;
+                if (banishCountRef.current >= BANISH_LIMIT) {
+                  roundCompleteRef.current = true;
+                  completeRound();
+                } else {
+                  nextSpawnAtRef.current = now + RESPAWN_DELAY_MS;
+                }
               }
-            } else if (nextSpawnAtRef.current !== null && now >= nextSpawnAtRef.current) {
+            } else if (!roundCompleteRef.current && nextSpawnAtRef.current !== null && now >= nextSpawnAtRef.current) {
               snakeRef.current.spawn();
               snakeActiveRef.current = true;
               nextSpawnAtRef.current = null;
@@ -403,11 +549,17 @@ export default function BubaciGamePage() {
               spiderRef.current.render(ctx, face, canvas.width, canvas.height, now);
               if (spiderRef.current.isDone()) {
                 spiderRef.current = null;
-                nextSpawnAtRef.current = now + RESPAWN_DELAY_MS;
+                if (banishCountRef.current >= BANISH_LIMIT) {
+                  roundCompleteRef.current = true;
+                  completeRound();
+                } else {
+                  nextSpawnAtRef.current = now + RESPAWN_DELAY_MS;
+                }
               }
-            } else if (nextSpawnAtRef.current !== null && now >= nextSpawnAtRef.current) {
+            } else if (!roundCompleteRef.current && nextSpawnAtRef.current !== null && now >= nextSpawnAtRef.current) {
               spiderRef.current = new SpiderEffect();
               nextSpawnAtRef.current = null;
+              capturePhotoBurst(PHOTO_DELAYS_MS);
             }
           }
         }
@@ -441,6 +593,7 @@ export default function BubaciGamePage() {
               banished = true;
             }
             if (banished) {
+              banishCountRef.current += 1;
               playSpellSound("banish");
               setBanishText("Bubák zahnán! 🎉");
               if (banishTimeoutRef.current) clearTimeout(banishTimeoutRef.current);
@@ -464,8 +617,10 @@ export default function BubaciGamePage() {
       window.speechSynthesis?.cancel();
       music?.pause();
       if (banishTimeoutRef.current) clearTimeout(banishTimeoutRef.current);
+      if (redirectTimeoutRef.current) clearTimeout(redirectTimeoutRef.current);
+      photoTimeouts.forEach(clearTimeout);
     };
-  }, [bubakType, isDementor, isSnake]);
+  }, [bubakType, isDementor, isSnake, router]);
 
   function toggleFullscreen() {
     // Browsers block audio autoplay until a real user gesture — this click
@@ -488,7 +643,7 @@ export default function BubaciGamePage() {
       <video ref={videoRef} className="absolute w-px h-px opacity-0" playsInline muted />
       <audio
         ref={musicRef}
-        src="/music/background.mp3"
+        src={asset("/music/background.mp3")}
         preload="auto"
         onLoadedMetadata={(e) => {
           e.currentTarget.currentTime = BUBACI_MUSIC_START_SECONDS;
@@ -528,5 +683,16 @@ export default function BubaciGamePage() {
         </p>
       )}
     </main>
+  );
+}
+
+// useSearchParams() needs a Suspense boundary for `next build` (production
+// mode) — the page itself is fully client-side, so the fallback is just
+// the same black screen it starts on anyway.
+export default function BubaciGamePage() {
+  return (
+    <Suspense fallback={<main className="min-h-screen bg-black" />}>
+      <BubaciGamePageInner />
+    </Suspense>
   );
 }

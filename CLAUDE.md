@@ -27,6 +27,32 @@ to itself, not a real backend.
   ```
   cd harry-potter-wand && source "$HOME/.nvm/nvm.sh" && nvm use 24.20.0 && npm run dev -- -p 3001
   ```
+- **For the camp itself, run the production build, not dev**: `npm run camp`
+  (= `npm run build && npm run start`, `start` is pinned to `-p 3001`). Much
+  lower memory use (this Mac has had swap pressure), no Strict Mode double
+  mounts, no dev error overlay. A production server does *not* pick up code
+  changes — stop it, rebuild, restart. `next build` requires a `<Suspense>`
+  boundary around anything using `useSearchParams()`, which is why every
+  `*/hra` page's default export is a thin Suspense wrapper around a
+  `*Inner` component.
+- **Offline**: MediaPipe WASM + all three models are served locally from
+  `public/mediapipe/` (gitignored, ~45MB) via `src/lib/mediapipe-assets.ts`
+  — never from jsdelivr/googleapis. `scripts/fetch-mediapipe-assets.mjs`
+  populates it (runs on `postinstall` and `prebuild`, or `npm run
+  fetch-assets`). `public/mediapipe/**` is in eslint's ignores. **What still
+  needs internet**: Chrome's Web Speech recognition (name-asking, spoken
+  Patronus) is server-side — bring a phone hotspot. Speech *synthesis*
+  prefers a `localService` Czech voice (`speak()` in `voice-greeting.ts`),
+  so it keeps working offline.
+- **Public web version (GitHub Pages)**: `npm run build:web` →
+  static export in `out/` (`scripts/build-web.mjs`), served from
+  `/harry-potter-wand/`. `.github/workflows/pages.yml` runs it on every
+  push to `main`. Driven by `NEXT_PUBLIC_WEB_BUILD`/`NEXT_PUBLIC_BASE_PATH`
+  (`src/lib/web-build.ts`): no lamp, no photo saving, operator tools
+  hidden on `/`. Route handlers can't be in a static export, so the script
+  temporarily moves `src/app/api` out of `src/app` during the build. Any
+  new raw asset URL (image/audio/model path, not a `<Link>`) must go
+  through `asset()` or it 404s under the subpath.
 - The dev server does **not** survive a Mac reboot/sleep-wake-with-restart — it has
   to be started manually every time after the machine restarts.
 - Always run `npx tsc --noEmit` and `npm run lint` (`eslint`) after any change to
@@ -37,7 +63,7 @@ to itself, not a real backend.
 
 ## Route map
 
-- `/` — home hub. Two activity tiles, extensible list (`ACTIVITIES` in
+- `/` — home hub. Three activity tiles, extensible list (`ACTIVITIES` in
   `src/app/page.tsx`). Background image is optional and configurable, see
   "Home hub background" below.
 - `/kouzla` — setup screen for "Základy kouzel" (spell basics): pick one of the
@@ -47,13 +73,34 @@ to itself, not a real backend.
 - `/bubaci` — setup screen for "Zažeň bubáka" (banish the boggart): pick a boggart
   type (`spiders`, `dementor`, or `snake`), links to `/bubaci/hra?bubak=<id>`.
 - `/bubaci/hra` — the boggart mini-game. See "bubaci/hra in detail" below.
+- `/famfrpal` — setup screen for "Trénink famfrpálu" (Quidditch training).
+  Picks one of 4 fixed round modes (duration x snitch speed — see
+  "famfrpal/hra in detail" below for why speed needed to be pickable at
+  all), same select-a-tile-then-confirm pattern as `/kouzla`/`/bubaci`, then
+  a button links to `/famfrpal/hra?duration=<seconds>&speed=<fast|slow>`.
+- `/famfrpal/hra` — catch-the-golden-snitch mini-game. See "famfrpal/hra in
+  detail" below.
+- Operator tools (small links at the bottom of `/`, `TOOLS` in `page.tsx`):
+  - `/kontrola` — pre-flight checklist: internet, camera (label +
+    resolution + live preview), actually loads all 3 models from local
+    files, all images, music, photo storage, local Czech TTS voice; plus
+    manual mic/speaker/lamp test buttons.
+  - `/fotky` — slideshow of every saved photo (`GET /api/photos`), for the
+    TV in the evening. Filter bubáci/patroni, ←/→, space = pause, click =
+    fullscreen + music; re-fetches every 30s.
+  - `/diplomy` — printable A4-landscape diploma per kouzla tutorial session
+    (sessions with a `meta.json`): editable name, kluk/holka verb ending,
+    photo picked from that session's Patronus shots, on-screen preview
+    (same component, scaled 0.5), print one or all (`@media print` shows
+    only `.diploma` sheets). Edits are page-local, never written back.
 
-Both `*/hra` pages follow the same overall shape: a hidden `<video>` element fed by
-`getUserMedia`, a full-screen `<canvas>` that's the only thing actually visible,
-`click` anywhere to enter fullscreen, and a `requestAnimationFrame` loop that reads
-the current video frame, runs ML inference on it, and redraws the canvas every
-frame. Both are "use client" pages with a single big `useEffect` that owns the
-camera stream + ML model lifecycles.
+All three `*/hra` pages follow the same overall shape: a hidden `<video>`
+element fed by `getUserMedia`, a full-screen `<canvas>` that's the only thing
+actually visible, `click` anywhere to enter fullscreen, and a
+`requestAnimationFrame` loop that reads the current video frame, runs ML
+inference on it, and redraws the canvas every frame. All three are "use
+client" pages with a single big `useEffect` that owns the camera stream + ML
+model lifecycles.
 
 ## `kouzla/hra` in detail (`src/app/kouzla/hra/page.tsx`)
 
@@ -308,7 +355,10 @@ mode stays a 2-model page:
 - **`snake`** — also `FaceLandmarker` (added after the owner noticed the strike
   always aimed at a fixed screen point regardless of where he'd moved — see
   below), no `ImageSegmenter`. Same model load as `spiders`, just used
-  differently (one landmark for aim, not six for crawling).
+  differently (one landmark for aim, not six for crawling). **Also loads
+  `ImageSegmenter` now, but photo-only** — it never runs per frame, only
+  inside `captureSnakePortrait()` a few times per strike (see "Boggart
+  reaction photos" below), so the per-frame cost is still 2 models.
 
 On ready, `runIntro()` fires **automatically** (unlike `kouzla/hra`'s now-manual N
 trigger — this asymmetry hasn't been revisited; if the manual-trigger preference
@@ -429,6 +479,95 @@ scenarios (clean swipe, clean circle, lightly/heavily noisy circle, up-down swip
 if this ever needs retuning, the knobs are all at the top of the file
 (`MAX_TURN_PER_STEP`, `MIN_TOTAL_TURN`, `MIN_RADIUS`, `SMOOTHING_RADIUS`).
 
+## `famfrpal/hra` in detail (`src/app/famfrpal/hra/page.tsx`)
+
+The newest and by far the simplest of the three `*/hra` pages — a
+catch-the-golden-snitch mini-game, added as a lightweight third activity
+alongside the spell tutorial and the boggart games (the owner has a *real*
+physical Sorting Hat for the event, so that idea stayed out of the app; house
+points also got skipped — the campers are preschool-age, unlikely to track a
+running score across activities). Loads only `HandLandmarker` — no face, no
+segmentation, no boggart-style variant branching — making it the lightest
+page in the app.
+
+**Duration and speed are both configurable from `/famfrpal`**, read via
+`useSearchParams()` (same pattern `kouzla/hra`/`bubaci/hra` already use for
+`bg`/`patronus`/`bubak`) — `?duration=<seconds>` (default `60`, via
+`DEFAULT_ROUND_DURATION_S`) and `?speed=fast|slow` (default `fast`). Added
+after the owner pointed out the group spans a wider age range than the
+minute-long/full-speed original design assumed: older kids handled it fine,
+but younger ones need both a shorter round and a slower snitch. `speed`
+doesn't gate a separate code path — `speedMultiplier` (1 for fast,
+`SLOW_SPEED_MULTIPLIER = 0.45` for slow) is passed straight into
+`GoldenSnitchEffect.setSpeedMultiplier()`, which just scales its existing
+`SPEED_FRACTION_PER_SEC` in `update()`. `roundDurationMs` (derived from
+`duration`) replaces what used to be a fixed `ROUND_DURATION_MS` constant
+everywhere it's used. Both values are stable for the page's lifetime (set
+once from the URL at mount, no in-page way to change them mid-round), so
+closing over them from the big `useEffect` is safe — they're just listed in
+its dependency array like `backgroundBasePath`/`patronusBasePath` are in
+`kouzla/hra`.
+
+**Flow**: on ready, `startRound()` fires automatically (no manual trigger,
+no name-asking — this is meant to be a quick, repeatable activity for a line
+of kids, not a one-on-one tutorial): speaks "Trénink famfrpálu! Chyť co
+nejvíc zlatonek, než vyprší čas!" (deliberately duration-agnostic wording,
+since the round can now be 30s or 60s), then a 3-2-1-"Chyť je!" on-screen
+countdown (`COUNTDOWN_STEPS`, `COUNTDOWN_STEP_MS` = 700ms per step, shown via
+`countdownText` — pure ceremony/drama, doesn't gate anything). Once that
+finishes: spawns the snitch, sets `roundEndAtRef.current = now +
+roundDurationMs`, and starts a `setInterval` (250ms) that just recomputes
+`timeLeftSeconds` for display — the actual round-active check elsewhere is
+`now < roundEndAtRef.current`, not this interval, so display lag/pausing
+doesn't affect gameplay timing.
+
+**Catch mechanic**: every frame, if a hand is tracked, landmark 9 (middle
+finger MCP — a stabler "center of the hand" point than the fingertip, which
+this game doesn't need to track precisely the way the wand-casting games do)
+is compared against `GoldenSnitchEffect.getPosition()`; within
+`CATCH_RADIUS_FRACTION` (0.07, i.e. 7% of canvas width — was 0.09, shrunk
+once per live feedback that the ring/tolerance felt too generous — still
+deliberately forgiving, this is built for small kids, not precision) of
+canvas width, it's
+a catch: `playSpellSound("catch")`, `scoreRef.current` increments (mirrored
+into `score` state for display — same ref-for-logic/state-for-display split
+used throughout this app, since the per-frame `loop()` closure would
+otherwise read a stale `score`), and `GoldenSnitchEffect.deactivate()` hides
+it (no draw, no update) rather than respawning it immediately —
+`respawnAtRef.current = now + RESPAWN_DELAY_MS` (900ms) is checked once per
+frame at the top of the `roundActive` block in `loop()`, and only then calls
+`spawn()` to place the next one. This deliberate gap replaced an earlier
+instant-respawn (teleport-on-catch, no pause at all) per live feedback that a
+short breather after each catch reads better than one appearing again
+immediately. `CATCH_COOLDOWN_MS` (400ms) still guards against the same catch
+registering across consecutive frames before `deactivate()` takes effect,
+though `isActive()` being false during the respawn gap now also prevents
+re-catching mid-pause on its own. A soft
+glowing ring is drawn at the catch point on every frame a hand is tracked
+(not just mid-round) — pure visual aid so kids can see exactly where they
+need to be, cheap (one more `shadowBlur` circle, same budget-conscious
+approach as everything else in this app).
+
+**Round end** is detected *inside* `loop()` (not the display `setInterval`,
+which only reads a value — never writes game state) via a
+`roundEndHandledRef` guard so it fires exactly once: plays
+`playSpellSound("fanfare")` and shows `` `Trénink dokončen! Chytil jsi
+${scoreRef.current} zlatonek! 🏆` ``. No in-page restart — same convention as
+the other two games: the owner navigates back to `/famfrpal` and clicks
+"Začít trénink" again for the next kid, which remounts the page and gets a
+completely fresh round.
+
+Everything (video, snitch, catch ring) is mirrored together in one transform,
+same simplification `bubaci/hra` uses (no separate background layer to keep
+unmirrored) — and since catch-detection compares the snitch's position
+against the hand's position, both computed in that same raw pre-mirror pixel
+space, the comparison is correct regardless of the mirror (mirroring only
+affects where things are *drawn*, not the coordinates used for game logic —
+this is the same reasoning `bubaci/hra`'s circle-gesture detection already
+relies on, as opposed to `kouzla/hra`'s left/right swipe classification,
+which *does* need a mirror-aware fix — see "Mirroring" below for why those
+two cases are different).
+
 ## Shared library code (`src/lib/`)
 
 - **`gesture-detector.ts`** — `GestureDetector`, 4-direction swipe classifier
@@ -522,9 +661,37 @@ if this ever needs retuning, the knobs are all at the top of the file
   the two earlier design iterations that got replaced, and why it ended up
   needing `FaceLandmarker` after all to aim its strike). `loadShape(url)`
   reuses `cutoutImageByLuminance()`, same as `DementorEffect`.
+- **`golden-snitch-effect.ts`** — `GoldenSnitchEffect`, see "famfrpal/hra in
+  detail" above. `loadShape(url)` reuses `cutoutImageByLuminance()`, same as
+  `DementorEffect`/`SnakeEffect`; until that resolves (or if the asset is
+  never supplied), `render()` falls back to a code-driven placeholder — a
+  glowing orb (`shadowBlur`) with two flapping wing ellipses, all canvas
+  paths, no asset needed for that fallback shape. Unlike the boggart effects,
+  this one isn't face/person-anchored at all: `spawn(canvasWidth, canvasHeight, now)` picks a
+  random point, then `update()` steers it toward a periodically-re-picked
+  random target (`RETARGET_MS`) at a constant speed (`SPEED_FRACTION_PER_SEC`,
+  a fraction of canvas width per second) — a simple "wander" behavior that
+  reads as erratic/unpredictable without needing a fancier steering model.
+  `getPosition()` exposes the current point for `famfrpal/hra`'s catch-check;
+  `isActive()` gates whether it should be updated/rendered/tested at all
+  (`famfrpal/hra` only calls `spawn()` once a round actually starts, so it's
+  invisible the rest of the time). `deactivate()` hides it without picking a
+  new position — `famfrpal/hra` calls this on a catch instead of an
+  immediate `spawn()`, to leave the `RESPAWN_DELAY_MS` gap described above.
+  `setSpeedMultiplier(multiplier)` scales `SPEED_FRACTION_PER_SEC` in
+  `update()` — `famfrpal/hra`'s "pomalá" modes pass `0.45`
+  (`SLOW_SPEED_MULTIPLIER`), "rychlá" leaves it at the default `1`; see
+  "famfrpal/hra in detail" above for why speed needed to be configurable at
+  all. `famfrpal/hra`-only, but nothing about the class is specific to that
+  page if a future activity wanted a wandering object with the same "steer
+  toward periodic random targets" behavior.
 - **`spell-sounds.ts`** — `playSpellSound(id)`, all sounds are synthesized with the
   Web Audio API (oscillator sweeps + short "sparkle" note sequences) — no audio
-  files. `SpellId` = `"lumos" | "nox" | "wingardium" | "expelliarmus" | "patronus" | "banish"`.
+  files. `SpellId` = `"lumos" | "nox" | "wingardium" | "expelliarmus" | "patronus" |
+  "banish" | "catch" | "fanfare"` — the last two are `famfrpal/hra`'s catch chime
+  and round-end fanfare; `SpellId` is really "any short synthesized game sound"
+  at this point, not literally just spells (`"banish"` already wasn't a spell
+  either — same precedent).
 - **`voice-recognition.ts`** — `normalize()` (lowercase, strip diacritics via NFD +
   combining-mark regex, strip non a-z), `matchesPatronusPhrase()`, and
   `startPatronusListener(onDetected, extraWords?)`. The Patronus listener runs
@@ -710,11 +877,14 @@ which isn't code-relevant but is useful background if this comes up again).
   - `kouzla/hra` — first `MUSIC_LOOP_END_SECONDS` (2:20 = 140s), i.e. `0:00`
     onward, at volume `0.35` (calmer, this is the gentle spell-practice game).
   - `bubaci/hra` — `BUBACI_MUSIC_START_SECONDS`-`BUBACI_MUSIC_END_SECONDS`
-    (2:30-3:40), at volume `BUBACI_MUSIC_VOLUME = 0.65` (louder/more tense —
-    the owner explicitly wanted this one dramatic, it's the scary-boggart
-    game). Needs an extra `onLoadedMetadata` handler (`kouzla/hra` doesn't)
-    to seek to `BUBACI_MUSIC_START_SECONDS` once, since this loop doesn't
-    start at `0:00` like the other one does.
+    (2:30-3:40), at volume `BUBACI_MUSIC_VOLUME = 0.5` (still louder/more
+    tense than `kouzla/hra`'s 0.35 — the owner explicitly wanted this one
+    dramatic, it's the scary-boggart game — but dialed down from an initial
+    `0.65` after a live check came back "trochu slaběji", then again to
+    `0.4` after the next live check still found `0.5` too loud). Needs an extra
+    `onLoadedMetadata` handler (`kouzla/hra` doesn't) to seek to
+    `BUBACI_MUSIC_START_SECONDS` once, since this loop doesn't start at
+    `0:00` like the other one does.
 - `menu/background.*` — optional, see "Home hub background" above. Doesn't exist by
   default.
 - `bubaci/mozkomor.jpg` — dementor source image for `bubaci/hra`'s `dementor`
@@ -738,6 +908,22 @@ which isn't code-relevant but is useful background if this comes up again).
   this one got replaced). `SnakeEffect` still tolerates a missing/failed image
   the same way `DementorEffect` does (renders nothing, banish/respawn state
   machine still runs).
+- `famfrpal/zlatonka.png` — golden snitch source image for `famfrpal/hra`,
+  resolved via `resolveImageUrl("/famfrpal/zlatonka")`. Supplied now — a
+  trophy/statue-style shot, wings fully spread flat (~2.2:1 aspect ratio),
+  already a proper pre-cut transparent PNG (real alpha, confirmed by sampling
+  pixels directly — what looks like a solid green background in a quick
+  preview is just the *viewer's* transparency matte, not baked into the file),
+  so `cutoutImageByLuminance()` passes it through untouched, same as
+  `had.png`. **This wide aspect ratio is why `GoldenSnitchEffect` sizes the
+  image as `canvasWidth * IMAGE_WIDTH_FRACTION` (0.12, shrunk once from an
+  initial 0.16 per live feedback that it looked too big) rather than relative
+  to `BODY_RADIUS`** (the placeholder circle's own sizing, unaffected) — at the
+  placeholder's scale this image would render tiny and paper-thin. If a
+  future snitch image is a different (rounder) shape, that sizing constant is
+  the thing to revisit; it exists specifically for this image's proportions,
+  not because canvas-width-relative sizing is inherently better than
+  radius-relative.
 
 ## Known open items / things awaiting live confirmation
 
@@ -779,6 +965,44 @@ which isn't code-relevant but is useful background if this comes up again).
   gesture-based tutorial steps) is also unconfirmed live** — reasoned through,
   not observed; check the pacing doesn't feel like an awkward pause once the
   instruction finishes and before the guide appears.
+- **`famfrpal/hra` (the golden-snitch mini-game) is brand new end to end and
+  entirely untested live.** Specifically first-guess values: `SPEED_FRACTION_PER_SEC`
+  (0.8, `golden-snitch-effect.ts` — bumped up from an initial `0.45` per the owner
+  before any live test at all, so still not actually confirmed live, just the
+  direction "faster"); `IMAGE_WIDTH_FRACTION` (0.12, `golden-snitch-effect.ts`
+  — shrunk once from `0.16` per owner feedback ("zmenšit"), again before any
+  live test, so the actual on-screen size still isn't confirmed);
+  `CATCH_RADIUS_FRACTION` (0.07, `famfrpal/hra/page.tsx` — shrunk once from
+  `0.09` per the same "zmenšit i ten kruh" feedback, tightening both the
+  visual ring and the actual catch tolerance together since they share one
+  constant) — untested against real hand-tracking jitter at typical webcam
+  distance, and now a real open question whether it's still generous enough
+  for small kids after being shrunk twice from the very first estimate;
+  `RESPAWN_DELAY_MS` (900ms, `famfrpal/hra/page.tsx` — added after the owner
+  asked for a pause between a catch and the next snitch appearing, where
+  originally there was none at all) — untested live, so 900ms is a first
+  guess at "a little longer than the instant respawn it replaced," not a
+  confirmed feel; `RETARGET_MS` (0.4-0.9s, shortened from an initial 0.9-1.8s — at
+  `SPEED_FRACTION_PER_SEC = 0.8` the snitch was reaching its target well
+  before the old timer fired and then just sitting still until it did, which
+  read as an unwanted pause; the shorter window retargets before/as it
+  arrives so it stays closer to continuous motion, but this fix itself is
+  unconfirmed live) — how erratic the wander behavior actually feels
+  live at the new speed; and `SLOW_SPEED_MULTIPLIER` (0.45,
+  `famfrpal/hra/page.tsx` — added along with the 4-mode `/famfrpal` setup
+  screen so younger kids get a slower snitch, see "famfrpal/hra in detail"
+  above) — a first guess at "half speed feels right," entirely untested live,
+  and the interaction with `RETARGET_MS` at a much slower absolute speed
+  hasn't been checked either (a slower snitch takes longer to reach any given
+  target, so the same retarget window behaves differently than it does at
+  full speed — might need its own tuning rather than assuming the fast-mode
+  fix transfers). Round length (30s vs. 60s, `DEFAULT_ROUND_DURATION_S = 60`
+  is just the fallback if `?duration=` is missing) is now the camp owner's
+  choice per-round via `/famfrpal`'s tile picker rather than a single fixed
+  value, so it's less of an open tuning question and more something to just
+  pick per kid live.
+  All are single constants at the top of `golden-snitch-effect.ts` or
+  `famfrpal/hra/page.tsx`.
 - The circle-gesture fix in `bubaci/hra` is verified only via synthetic
   in-browser test data, not yet confirmed with a real kid-drawn circle.
 - The wand-tip extrapolation (`WAND_TIP_EXTENSION = 0.7`), the `dementor`
@@ -789,13 +1013,71 @@ which isn't code-relevant but is useful background if this comes up again).
   they were built. Worth a live check once possible; each is just a small
   handful of tunable constants at the top of its file if something feels off
   (too subtle, too slow, wrong size, etc.).
-- `layout.tsx` still has the default `create-next-app` metadata (`title: "Create
-  Next App"`) — never customized, purely cosmetic (browser tab title), harmless.
-- Ideas discussed but not built: house points system, a Sorting Hat activity.
-- `bubaci/hra`'s background music (2:30-3:40 loop, volume 0.65) is brand new
-  and untested live — whether that segment/volume actually reads as
-  "dramatic" against real gameplay + spell sound effects, or just as loud,
-  hasn't been checked with a real kid and TV speakers yet.
+- Ideas discussed but not built: house points system (skipped — the campers
+  are preschool-age, unlikely to track a running score), a Sorting Hat
+  activity (skipped — the owner has a real physical Sorting Hat for the
+  event, so no in-app version needed).
+- `bubaci/hra`'s background music (2:30-3:40 loop) got two live checks — the
+  segment itself was fine, just too loud at `0.65` and then still at `0.5`,
+  now `0.4` — that latest adjustment hasn't been re-confirmed live yet.
+- `bubaci/hra` ends a round after `BANISH_LIMIT` (5) banishes and returns to
+  `/` `ROUND_COMPLETE_REDIRECT_MS` (2000ms, shortened from 5000 on request)
+  after the spoken congratulation. `famfrpal/hra` likewise returns to
+  `/famfrpal` 5000ms after showing the final score.
+- MediaPipe's WASM prints "INFO: Created TensorFlow Lite XNNPACK delegate
+  for CPU." via `console.error`, which the Next dev overlay shows as a
+  "Console Error". It's harmless; `silenceMediapipeInfoLogs()`
+  (`src/lib/silence-mediapipe-logs.ts`, called at the top of every `*/hra`
+  page's effect) drops `console.error` lines starting with `INFO:`.
+- **`famfrpal` expert level** (`?speed=expert`, one 30s tile on
+  `/famfrpal`, grid is now `grid-cols-5`): `EXPERT_SPEED_MULTIPLIER = 1.4`,
+  and `GoldenSnitchEffect.setSpawnAnywhere(true)` makes `spawn()` pick a
+  random point anywhere in frame at least `MIN_SPAWN_DISTANCE_FRACTION` (0.3
+  of canvas width) away from the last tracked palm position — added because
+  the default near-center spawn meant a hand parked mid-screen caught most
+  respawns. Expert also uses `setRetargetMultiplier(0.5)` (direction
+  changes every 200-450ms instead of 400-900ms) so it dodges more sharply.
+  Untested live.
+- **Boggart reaction photos** (`bubaci/hra`): each time a boggart appears
+  (spider/dementor spawn, or each snake strike reaching "holding" — tracked
+  via `SnakeEffect.getStrikeCount()`), a burst of 3 canvas JPEG snapshots
+  (`PHOTO_DELAYS_MS` / `SNAKE_PHOTO_DELAYS_MS`) is POSTed to
+  `src/app/api/photos/route.ts`, which writes them to
+  `photos/bubaci/<timestamp>_<bubak>/` in the project root (one folder per
+  page load, i.e. per kid). `/photos/` is gitignored — photos of kids, never
+  commit them. Captures only the canvas (camera + boggart + trail), not the
+  DOM text overlays. The on-screen snake covers the kid's face at peak
+  strike, so snake strikes *additionally* save a "portrait" per burst shot
+  (`captureSnakePortrait()`, label `snake-portrait-N`): an off-screen
+  composite of camera → smaller snake (`SnakeEffect.drawPortrait()`,
+  `SNAKE_PORTRAIT_*` constants) beside/above the last known face → the
+  segmented kid on top, so the snake appears *behind* them (confirmed
+  working on a real photo).
+- **Photo storage** is shared: `src/lib/photo-store.ts` (server — paths,
+  validation, `listSessions()`; all request-derived paths go through
+  `photosPath()` with a `turbopackIgnore` comment so `next build` doesn't
+  trace the whole project), `src/app/api/photos/` (`POST` image, `GET` list,
+  `file/` serves one JPEG, `meta/` merges `meta.json`), and
+  `src/lib/photo-upload.ts` (client helpers). Games allowed: `bubaci`,
+  `kouzla`.
+- **Patronus photos** (`kouzla/hra`): every cast saves 3 shots
+  (`PATRONUS_PHOTO_DELAYS_MS`, timed to the effect's full-visibility
+  window). Not raw canvas snapshots — on screen the Patronus is drawn over
+  everyone and hid the kid's face, so `composePatronusPhoto()` builds each
+  one off-screen: background → Patronus (`PatronusEffect.drawPortrait()`,
+  `PATRONUS_PHOTO_*` constants) centered in whichever side gap next to the
+  kid is wider (kid bounds via `computeMaskBounds()` on that frame's mask)
+  → mirrored kid cutout on top, so the Patronus stands *behind/beside*
+  them. The timeouts only set `pendingPhotoLabel`; `loop()` takes the shot
+  on the next frame since it needs that frame's mask + cut-out person
+  canvas (confirmed working live). The page stays open for a whole line of kids, so each N press
+  starts a new `…_tutorial` session (casts before any N go to
+  `…_volna-hra`); the tutorial writes `{ patronus }` to its meta.json up
+  front and `{ name }` once heard — `askForName()` (new in
+  `voice-greeting.ts`) returns the nominative for the diploma alongside the
+  vocative for the greeting; `askForVocativeName()` is now a thin wrapper.
+  `PATRONUS_CATALOG` is imported by `kouzla/hra` again for the label.
+  Untested live.
 - The Mac this runs on has had recurring swap/memory pressure (dev server getting
   killed by "system low on memory", swap seen at 93-95% full). A full restart
   fixed it before; if the dev server keeps dying immediately after restart, that's

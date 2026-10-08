@@ -46,7 +46,11 @@ export async function speak(text: string, lang = "cs-CZ"): Promise<void> {
   if (!("speechSynthesis" in window)) return;
 
   const voices = await waitForVoices();
-  const matchingVoice = voices.find((v) => v.lang.toLowerCase().startsWith(lang.slice(0, 2)));
+  // Prefer a voice installed on the Mac itself (localService) over Chrome's
+  // online "Google" voices — the camp cottage may have no internet, and an
+  // online voice would then just silently fail to speak.
+  const langVoices = voices.filter((v) => v.lang.toLowerCase().startsWith(lang.slice(0, 2)));
+  const matchingVoice = langVoices.find((v) => v.localService) ?? langVoices[0];
   if (!matchingVoice) {
     console.warn(`[wand] no ${lang} voice installed on this Mac — speech will sound off`);
   }
@@ -127,12 +131,13 @@ export function extractName(transcript: string): string {
 }
 
 // Asks the child's name out loud, listens for the answer, and returns it
-// already declined into the Czech vocative (5th case) — or null if nothing
-// usable was heard (an apology is spoken in that case so it doesn't feel
-// like the app just silently failed).
-export async function askForVocativeName(
+// both as heard (nominative — used for kouzla/hra's printable diploma) and
+// declined into the Czech vocative (5th case, for greeting them) — or null
+// if nothing usable was heard (an apology is spoken in that case so it
+// doesn't feel like the app just silently failed).
+export async function askForName(
   onStatus: (text: string | null) => void
-): Promise<string | null> {
+): Promise<{ name: string; vocative: string } | null> {
   onStatus("Kdo se to sem přikradl? Jak se jmenuješ?");
   await speak("Kdo se to sem přikradl? Jak se jmenuješ?");
 
@@ -148,7 +153,13 @@ export async function askForVocativeName(
   }
 
   onStatus(null);
-  return toVocative(name);
+  return { name, vocative: toVocative(name) };
+}
+
+export async function askForVocativeName(
+  onStatus: (text: string | null) => void
+): Promise<string | null> {
+  return (await askForName(onStatus))?.vocative ?? null;
 }
 
 export async function runNameGreeting(onStatus: (text: string | null) => void): Promise<void> {

@@ -1,4 +1,4 @@
-export type SpellId = "lumos" | "nox" | "wingardium" | "expelliarmus" | "patronus" | "banish";
+export type SpellId = "lumos" | "nox" | "wingardium" | "expelliarmus" | "patronus" | "banish" | "catch" | "fanfare";
 
 let audioCtx: AudioContext | null = null;
 
@@ -59,6 +59,12 @@ export function playSpellSound(spell: SpellId) {
     case "banish":
       tone(ctx, now, 500, 3000, 0.2, 0.22); // quick upward zap
       sparkle(ctx, now + 0.15, [1568, 2093], 0.08); // tiny "poof"
+      break;
+    case "catch":
+      sparkle(ctx, now, [784, 988, 1318], 0.05); // quick bright "got it" chime
+      break;
+    case "fanfare":
+      sparkle(ctx, now, [523, 659, 784, 1046, 1318], 0.09); // bigger ascending run for round-end
       break;
   }
 }

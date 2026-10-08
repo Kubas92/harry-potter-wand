@@ -50,6 +50,26 @@ export class PatronusEffect {
     this.active = true;
   }
 
+  // Static full-opacity draw for kouzla/hra's Patronus photo, where it's
+  // composited *behind* the kid (on screen it's a screen-space overlay on
+  // top of everyone). Fits within maxW x maxH centered at (cx, cy); returns
+  // false if the shape isn't loaded yet.
+  drawPortrait(ctx: CanvasRenderingContext2D, cx: number, cy: number, maxW: number, maxH: number): boolean {
+    if (!this.cutout) return false;
+    let w = maxW;
+    let h = w / this.aspect;
+    if (h > maxH) {
+      h = maxH;
+      w = h * this.aspect;
+    }
+    ctx.save();
+    ctx.shadowColor = "rgba(150,200,255,0.9)";
+    ctx.shadowBlur = 28;
+    ctx.drawImage(this.cutout, cx - w / 2, cy - h / 2, w, h);
+    ctx.restore();
+    return true;
+  }
+
   update(now: number) {
     if (!this.active) return;
     if (now - this.startTime > TOTAL_MS) {

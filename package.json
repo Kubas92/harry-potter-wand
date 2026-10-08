@@ -4,8 +4,13 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "fetch-assets": "node scripts/fetch-mediapipe-assets.mjs",
+    "postinstall": "node scripts/fetch-mediapipe-assets.mjs",
+    "prebuild": "node scripts/fetch-mediapipe-assets.mjs",
     "build": "next build",
-    "start": "next start",
+    "build:web": "node scripts/fetch-mediapipe-assets.mjs && node scripts/build-web.mjs",
+    "start": "next start -p 3001",
+    "camp": "npm run build && npm run start",
     "lint": "eslint"
   },
   "dependencies": {

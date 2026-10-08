@@ -51,6 +51,9 @@ export class SnakeEffect {
   private banishing = false;
   private banishStart = 0;
   private done = false;
+  // Monotonic count of strikes that reached full size — bubaci/hra watches
+  // this to snap reaction photos at the scariest moment of each strike.
+  private strikeCount = 0;
 
   constructor() {
     this.resetState();
@@ -98,6 +101,21 @@ export class SnakeEffect {
     return this.done;
   }
 
+  getStrikeCount() {
+    return this.strikeCount;
+  }
+
+  // Static draw for bubaci/hra's "portrait" reaction photo (snake lurking
+  // behind the kid instead of filling the screen) — centered at (cx, cy)
+  // px, `width` px wide, independent of the strike state machine. Returns
+  // false if the image isn't loaded, so the caller can skip the photo.
+  drawPortrait(ctx: CanvasRenderingContext2D, cx: number, cy: number, width: number): boolean {
+    if (!this.cutout) return false;
+    const h = width / this.aspect;
+    ctx.drawImage(this.cutout, cx - width / 2, cy - h / 2, width, h);
+    return true;
+  }
+
   render(
     ctx: CanvasRenderingContext2D,
     canvasWidth: number,
@@ -119,6 +137,7 @@ export class SnakeEffect {
       } else if (this.phase === "lunging" && elapsed >= LUNGE_MS) {
         this.phase = "holding";
         this.phaseStart = now;
+        this.strikeCount += 1;
       } else if (this.phase === "holding" && elapsed >= HOLD_MS) {
         this.phase = "retreating";
         this.phaseStart = now;

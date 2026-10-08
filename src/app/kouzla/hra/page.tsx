@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { HandLandmarker, ImageSegmenter, FilesetResolver } from "@mediapipe/tasks-vision";
 import { GestureDetector, Direction } from "@/lib/gesture-detector";
@@ -8,11 +8,16 @@ import { WandTrailEffect } from "@/lib/wand-trail";
 import { SpellBoltEffect } from "@/lib/spell-bolt-effect";
 import { FeatherEffect } from "@/lib/feather-effect";
 import { playSpellSound, SpellId } from "@/lib/spell-sounds";
-import { applyMaskAlpha } from "@/lib/background-composite";
+import { silenceMediapipeInfoLogs } from "@/lib/silence-mediapipe-logs";
+import { WASM_BASE, HAND_MODEL_URL, SEGMENTER_MODEL_URL } from "@/lib/mediapipe-assets";
+import { applyMaskAlpha, computeMaskBounds, NormalizedBounds } from "@/lib/background-composite";
 import { PatronusEffect } from "@/lib/patronus-effect";
 import { startPatronusListener } from "@/lib/voice-recognition";
-import { askForVocativeName, speak } from "@/lib/voice-greeting";
+import { askForName, speak } from "@/lib/voice-greeting";
+import { newPhotoSession, saveSessionMeta, uploadCanvasPhoto } from "@/lib/photo-upload";
+import { PATRONUS_CATALOG } from "@/lib/patronus-catalog";
 import { resolveImageUrl } from "@/lib/resolve-asset";
+import { asset, WEB_BUILD } from "@/lib/web-build";
 
 // Lumos and Expelliarmus are deliberately not in this map — each has its own
 // dedicated, stricter GestureDetector instance (see lumosDetectorRef /
@@ -21,18 +26,23 @@ import { resolveImageUrl } from "@/lib/resolve-asset";
 // just any left-swipe. Only right/up dispatch through this generic map.
 type SwipeSpellDirection = Exclude<Direction, "down" | "left">;
 
+// ms after a Patronus cast — its fade-in is 600ms and hold 2200ms (see
+// patronus-effect.ts), so these land while it's fully visible.
+const PATRONUS_PHOTO_DELAYS_MS = [900, 1600, 2400] as const;
+// On screen the Patronus is drawn over everyone, which in a photo hides
+// the kid — so photos are composed separately: background → Patronus on
+// whichever side of the kid has more room → kid cutout on top. Sizes are
+// fractions of the canvas; the threshold is for finding the kid's bounds.
+const PATRONUS_PHOTO_MAX_W = 0.45;
+const PATRONUS_PHOTO_MAX_H = 0.7;
+const PERSON_MASK_THRESHOLD = 0.5;
+
 const SPELLS: Record<SwipeSpellDirection, { id: SpellId; label: string }> = {
   right: { id: "nox", label: "Nox!" },
   up: { id: "wingardium", label: "Wingardium Leviosa!" },
 };
 
 const EXPELLIARMUS_BOLT_COLOR = "#22ff6a";
-
-const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
-const HAND_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
-const SEGMENTER_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 
 // If the background/person swap looks backwards once you test it (person
 // disappears, background shows through where the person is), just flip this.
@@ -49,7 +59,7 @@ const LOADING_MESSAGES: Record<string, string> = {
   segmenter: "Připravuji pozadí...",
 };
 
-export default function WandGamePage() {
+function WandGamePageInner() {
   const searchParams = useSearchParams();
   const backgroundId = searchParams.get("bg") ?? "1";
   const patronusId = searchParams.get("patronus") ?? "1";
@@ -57,6 +67,7 @@ export default function WandGamePage() {
   // matter whether a dropped-in photo is .jpg, .jpeg, .png or .webp.
   const backgroundBasePath = `/backgrounds/${backgroundId}`;
   const patronusBasePath = `/patronus/${patronusId}`;
+  const patronusLabel = PATRONUS_CATALOG.find((p) => p.id === patronusId)?.label ?? "";
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const musicRef = useRef<HTMLAudioElement>(null);
@@ -117,11 +128,73 @@ export default function WandGamePage() {
   }, [status]);
 
   useEffect(() => {
+    silenceMediapipeInfoLogs();
     let cancelled = false;
     let stream: MediaStream | null = null;
     let handLandmarker: HandLandmarker | null = null;
     let imageSegmenter: ImageSegmenter | null = null;
     const music = musicRef.current;
+
+    // Patronus photos: each cast saves a few composed shots (see
+    // PATRONUS_PHOTO_* above) into photos/kouzla/<session>/. The timeouts
+    // only *request* a shot; loop() takes it on the next frame, since it
+    // needs that frame's segmentation mask (for the kid's bounds) and
+    // freshly cut-out person canvas.
+    // This page stays open for a whole line of kids (N starts each one's
+    // tutorial), so a fresh session — one folder per kid — starts on every
+    // N press; casts before the first N go to a "volna-hra" session. The
+    // tutorial also stores the kid's name + patronus in that session's
+    // meta.json, which /diplomy uses for the printable diploma.
+    let photoSession = newPhotoSession("volna-hra");
+    const photoTimeouts = new Set<ReturnType<typeof setTimeout>>();
+    let pendingPhotoLabel: string | null = null;
+    function capturePatronusPhotos() {
+      PATRONUS_PHOTO_DELAYS_MS.forEach((delay, i) => {
+        const t = setTimeout(() => {
+          photoTimeouts.delete(t);
+          pendingPhotoLabel = `patronus-${i + 1}`;
+        }, delay);
+        photoTimeouts.add(t);
+      });
+    }
+
+    function composePatronusPhoto(label: string, person: HTMLCanvasElement, bounds: NormalizedBounds | null) {
+      const w = person.width;
+      const h = person.height;
+      const photo = document.createElement("canvas");
+      photo.width = w;
+      photo.height = h;
+      const ctx = photo.getContext("2d")!;
+
+      const bg = backgroundImgRef.current;
+      if (bg) ctx.drawImage(bg, 0, 0, w, h);
+      else {
+        ctx.fillStyle = "#0a0a12";
+        ctx.fillRect(0, 0, w, h);
+      }
+
+      // Bounds are in raw (unmirrored) space; the kid is drawn mirrored, so
+      // their on-screen center is 1 - raw center.
+      const kidX = bounds ? 1 - (bounds.minX + bounds.maxX) / 2 : 0.5;
+      const kidY = bounds ? (bounds.minY + bounds.maxY) / 2 : 0.5;
+      const patronusX = kidX > 0.5 ? kidX / 2 : kidX + (1 - kidX) / 2;
+      const drawn = patronusRef.current.drawPortrait(
+        ctx,
+        patronusX * w,
+        Math.min(kidY, 0.55) * h,
+        w * PATRONUS_PHOTO_MAX_W,
+        h * PATRONUS_PHOTO_MAX_H
+      );
+      if (!drawn) return;
+
+      ctx.save();
+      ctx.scale(-1, 1);
+      ctx.translate(-w, 0);
+      ctx.drawImage(person, 0, 0);
+      ctx.restore();
+
+      uploadCanvasPhoto("kouzla", photoSession, label, photo);
+    }
 
     // Each of these is idempotent (null-guarded + nulls itself out), so it's
     // safe to call from both a cancellation checkpoint inside init() and the
@@ -177,6 +250,7 @@ export default function WandGamePage() {
       console.log("[wand] Expecto Patronum recognized!");
       patronusRef.current.trigger(canvas.width, canvas.height);
       playSpellSound("patronus");
+      capturePatronusPhotos();
       setSpellText("Expecto Patronum!");
       if (spellTimeoutRef.current) clearTimeout(spellTimeoutRef.current);
       spellTimeoutRef.current = setTimeout(() => setSpellText(null), 2500);
@@ -211,12 +285,15 @@ export default function WandGamePage() {
       introInProgress = true;
       tutorialStepRef.current = "pending";
       patronusListener.setPaused(true);
+      photoSession = newPhotoSession("tutorial");
+      saveSessionMeta("kouzla", photoSession, { patronus: patronusLabel });
       try {
         setGreetingText("...");
-        const vocative = await askForVocativeName(setGreetingText);
+        const heard = await askForName(setGreetingText);
         if (cancelled) return;
+        if (heard) saveSessionMeta("kouzla", photoSession, { name: heard.name });
 
-        const name = vocative ?? "kouzelníku";
+        const name = heard?.vocative ?? "kouzelníku";
         const greeting = `Ahoj, ${name}!`;
         setGreetingText(greeting);
         await speak(greeting);
@@ -461,7 +538,7 @@ export default function WandGamePage() {
       // a local macOS Shortcut (see src/app/api/lamp/route.ts). Fire-and-forget
       // — a missing/unpaired plug or a Shortcut that hasn't been set up yet
       // must never break the game.
-      if (id === "lumos" || id === "nox") {
+      if (!WEB_BUILD && (id === "lumos" || id === "nox")) {
         fetch("/api/lamp", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -501,16 +578,25 @@ export default function WandGamePage() {
         const segResult = imageSegmenter.segmentForVideo(video, now);
         const mask = segResult.confidenceMasks?.[0];
         if (mask) {
+          const maskData = mask.getAsFloat32Array();
+          const photoLabel = pendingPhotoLabel;
+          const photoBounds = photoLabel
+            ? computeMaskBounds(maskData, mask.width, mask.height, PERSON_MASK_THRESHOLD, INVERT_SEGMENTATION_MASK)
+            : null;
           applyMaskAlpha(
             personCtx,
             personCanvas.width,
             personCanvas.height,
-            mask.getAsFloat32Array(),
+            maskData,
             mask.width,
             mask.height,
             INVERT_SEGMENTATION_MASK
           );
           mask.close();
+          if (photoLabel) {
+            pendingPhotoLabel = null;
+            composePatronusPhoto(photoLabel, personCanvas, photoBounds);
+          }
         }
 
         // Only the person (+ the trail drawn on top of them) is mirrored —
@@ -762,8 +848,9 @@ export default function WandGamePage() {
       music?.pause();
       window.removeEventListener("keydown", onKeyDown);
       if (spellTimeoutRef.current) clearTimeout(spellTimeoutRef.current);
+      photoTimeouts.forEach(clearTimeout);
     };
-  }, [backgroundBasePath, patronusBasePath]);
+  }, [backgroundBasePath, patronusBasePath, patronusLabel]);
 
   function toggleFullscreen() {
     // Browsers block audio autoplay until a real user gesture — this click
@@ -786,7 +873,7 @@ export default function WandGamePage() {
       <video ref={videoRef} className="absolute w-px h-px opacity-0" playsInline muted />
       <audio
         ref={musicRef}
-        src="/music/background.mp3"
+        src={asset("/music/background.mp3")}
         preload="auto"
         onTimeUpdate={(e) => {
           // Loop just the first 2:20 of the track instead of the whole
@@ -827,5 +914,16 @@ export default function WandGamePage() {
         </p>
       )}
     </main>
+  );
+}
+
+// useSearchParams() needs a Suspense boundary for `next build` (production
+// mode) — the page itself is fully client-side, so the fallback is just
+// the same black screen it starts on anyway.
+export default function WandGamePage() {
+  return (
+    <Suspense fallback={<main className="min-h-screen bg-black" />}>
+      <WandGamePageInner />
+    </Suspense>
   );
 }
